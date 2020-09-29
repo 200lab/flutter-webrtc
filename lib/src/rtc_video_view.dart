@@ -1,115 +1,113 @@
 import 'dart:async';
 import 'dart:math';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
-import 'enums.dart';
 import 'media_stream.dart';
 import 'utils.dart';
+import 'enums.dart';
 
-@immutable
-class RTCVideoValue {
-  const RTCVideoValue({
-    this.width = 0.0,
-    this.height = 0.0,
-    this.rotation = 0,
-    this.renderVideo = false,
-  });
-  static const empty = RTCVideoValue();
-  final double width;
-  final double height;
-  final int rotation;
-  final bool renderVideo;
-  double get aspectRatio {
-    if (width == 0.0 || height == 0.0) {
-      return 1.0;
-    }
-    return (rotation == 90 || rotation == 270)
-        ? height / width
-        : width / height;
-  }
-
-  RTCVideoValue copyWith({
-    double width,
-    double height,
-    int rotation,
-    bool renderVideo,
-  }) {
-    return RTCVideoValue(
-      width: width ?? this.width,
-      height: height ?? this.height,
-      rotation: rotation ?? this.rotation,
-      renderVideo: (this.width != 0 && this.height != 0 && renderVideo) ??
-          this.renderVideo,
-    );
-  }
-
-  @override
-  String toString() =>
-      '$runtimeType(width: $width, height: $height, rotation: $rotation)';
-}
-
-class RTCVideoRenderer extends ValueNotifier<RTCVideoValue> {
-  RTCVideoRenderer() : super(RTCVideoValue.empty);
-  final _channel = WebRTC.methodChannel();
+class RTCVideoRenderer {
+  MethodChannel _channel = WebRTC.methodChannel();
   int _textureId;
+  bool _disposed = false;
+  int _rotation = 0;
+  double _width = 0.0, _height = 0.0;
+  bool _mirror = false;
+  double _aspectRatio = 1.0;
   MediaStream _srcObject;
+  RTCVideoViewObjectFit _objectFit =
+      RTCVideoViewObjectFit.RTCVideoViewObjectFitContain;
   StreamSubscription<dynamic> _eventSubscription;
 
-  Future<void> initialize() async {
-    final response = await _channel
-        .invokeMethod<Map<dynamic, dynamic>>('createVideoRenderer', {});
+  dynamic onStateChanged;
+
+  void initialize() async {
+    final Map<dynamic, dynamic> response =
+    await _channel.invokeMethod('createVideoRenderer', {});
     _textureId = response['textureId'];
-    _eventSubscription = EventChannel('FlutterWebRTC/Texture$textureId')
+    if (_disposed) {
+      dispose();
+      return;
+    }
+    _eventSubscription = _eventChannelFor(_textureId)
         .receiveBroadcastStream()
         .listen(eventListener, onError: errorListener);
   }
 
+  int get rotation => _rotation;
+
+  double get width => _width;
+
+  double get height => _height;
+
   int get textureId => _textureId;
 
-  MediaStream get srcObject => _srcObject;
+  double get aspectRatio => (_width == 0 || _height == 0)
+      ? 1.0
+      : (_rotation == 90 || _rotation == 270)
+      ? _height / _width
+      : _width / _height;
 
-  set srcObject(MediaStream stream) {
-    if (textureId == null) throw 'Call initialize before setting the stream';
+  bool get mirror => _mirror;
 
-    _srcObject = stream;
-    _channel.invokeMethod('videoRendererSetSrcObject', <String, dynamic>{
-      'textureId': textureId,
-      'streamId': stream?.id ?? '',
-      'ownerTag': stream?.ownerTag ?? ''
-    }).then((_) {
-      value = (stream == null)
-          ? RTCVideoValue.empty
-          : value.copyWith(renderVideo: renderVideo);
-    });
+  set mirror(bool mirror) {
+    _mirror = mirror;
+    if (onStateChanged != null) {
+      onStateChanged();
+    }
   }
 
-  @override
-  Future<void> dispose() async {
-    super.dispose();
-    await _eventSubscription?.cancel();
-    await _channel.invokeMethod(
-      'videoRendererDispose',
-      <String, dynamic>{'textureId': _textureId},
-    );
+  RTCVideoViewObjectFit get objectFit => _objectFit;
+
+  set objectFit(RTCVideoViewObjectFit objectFit) {
+    _objectFit = objectFit;
+    if (onStateChanged != null) {
+      onStateChanged();
+    }
+  }
+
+  set srcObject(MediaStream stream) {
+    if (_textureId != null) {
+      _srcObject = stream;
+      _channel.invokeMethod('videoRendererSetSrcObject', <String, dynamic>{
+        'textureId': _textureId,
+        'streamId': stream != null ? stream.id : '',
+        'ownerTag': stream != null ? stream.ownerTag : ''
+      });
+    }
+  }
+
+  Future<Null> dispose() async {
+    _disposed = true;
+    if (_textureId != null) {
+      await _eventSubscription?.cancel();
+      await _channel.invokeMethod(
+        'videoRendererDispose',
+        <String, dynamic>{'textureId': _textureId},
+      );
+      _textureId = null;
+    }
+  }
+
+  EventChannel _eventChannelFor(int textureId) {
+    return EventChannel('FlutterWebRTC/Texture$textureId');
   }
 
   void eventListener(dynamic event) {
     final Map<dynamic, dynamic> map = event;
     switch (map['event']) {
       case 'didTextureChangeRotation':
-        value =
-            value.copyWith(rotation: map['rotation'], renderVideo: renderVideo);
+        _rotation = map['rotation'];
         break;
       case 'didTextureChangeVideoSize':
-        value = value.copyWith(
-            width: 0.0 + map['width'],
-            height: 0.0 + map['height'],
-            renderVideo: renderVideo);
+        _width = 0.0 + map['width'];
+        _height = 0.0 + map['height'];
         break;
       case 'didFirstFrameRendered':
         break;
+    }
+    if (onStateChanged != null) {
+      onStateChanged();
     }
   }
 
@@ -117,62 +115,77 @@ class RTCVideoRenderer extends ValueNotifier<RTCVideoValue> {
     final PlatformException e = obj;
     throw e;
   }
-
-  bool get renderVideo => srcObject != null;
 }
 
-class RTCVideoView extends StatelessWidget {
-  RTCVideoView(
-    this._renderer, {
-    Key key,
-    this.objectFit = RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-    this.mirror = false,
-  })  : assert(objectFit != null),
-        assert(mirror != null),
-        super(key: key);
+class RTCVideoView extends StatefulWidget {
+  RTCVideoView(this._renderer, {Key key}) : super(key: key);
 
   final RTCVideoRenderer _renderer;
-  final RTCVideoViewObjectFit objectFit;
-  final bool mirror;
 
   @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-        builder: (BuildContext context, BoxConstraints constraints) =>
-            _buildVideoView(constraints));
+  _RTCVideoViewState createState() => _RTCVideoViewState();
+}
+
+class _RTCVideoViewState extends State<RTCVideoView> {
+  double _aspectRatio;
+  RTCVideoViewObjectFit _objectFit;
+  bool _mirror;
+
+  @override
+  void initState() {
+    super.initState();
+    _setCallbacks();
+    _aspectRatio = widget._renderer.aspectRatio;
+    _mirror = widget._renderer.mirror;
+    _objectFit = widget._renderer.objectFit;
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    widget._renderer.onStateChanged = null;
+  }
+
+  void _setCallbacks() {
+    widget._renderer.onStateChanged = () {
+      setState(() {
+        _aspectRatio = widget._renderer.aspectRatio;
+        _mirror = widget._renderer.mirror;
+        _objectFit = widget._renderer.objectFit;
+      });
+    };
   }
 
   Widget _buildVideoView(BoxConstraints constraints) {
-    return Center(
-      child: Container(
+    return Container(
         width: constraints.maxWidth,
         height: constraints.maxHeight,
         child: FittedBox(
-          fit: objectFit == RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
-              ? BoxFit.contain
-              : BoxFit.cover,
-          child: Center(
-            child: ValueListenableBuilder<RTCVideoValue>(
-              valueListenable: _renderer,
-              builder:
-                  (BuildContext context, RTCVideoValue value, Widget child) {
-                return SizedBox(
-                  width: constraints.maxHeight * value.aspectRatio,
-                  height: constraints.maxHeight,
-                  child: value.renderVideo ? child : Container(),
-                );
-              },
-              child: Transform(
-                transform: Matrix4.identity()..rotateY(mirror ? -pi : 0.0),
-                alignment: FractionalOffset.center,
-                child: _renderer.textureId != null
-                    ? Texture(textureId: _renderer.textureId)
-                    : Container(),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
+            fit:
+            _objectFit == RTCVideoViewObjectFit.RTCVideoViewObjectFitContain
+                ? BoxFit.contain
+                : BoxFit.cover,
+            child:  Center(
+                child:  SizedBox(
+                    width: constraints.maxHeight * _aspectRatio,
+                    height: constraints.maxHeight,
+                    child:  Transform(
+                        transform: Matrix4.identity()
+                          ..rotateY(_mirror ? -pi : 0.0),
+                        alignment: FractionalOffset.center,
+                        child:  Texture(
+                            textureId: widget._renderer._textureId),),),),),);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final renderVideo = widget._renderer._textureId != null &&
+        widget._renderer._srcObject != null;
+
+    return  LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          return  Center(
+              child: renderVideo ? _buildVideoView(constraints) : const SizedBox());
+        });
   }
 }
