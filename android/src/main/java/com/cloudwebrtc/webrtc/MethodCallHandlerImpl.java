@@ -1390,6 +1390,7 @@ public class MethodCallHandlerImpl implements MethodCallHandler, StateProvider {
       }
       for (AudioTrack track : mediaStream.audioTracks) {
         localTracks.remove(track.id());
+        track.dispose();
       }
       localStreams.remove(id);
     } else {
